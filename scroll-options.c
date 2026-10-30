@@ -8,8 +8,10 @@
 // scrolling, and Windows apps scroll three lines (~100 px in a browser) per
 // notch, so a slow swipe travels about ten times as far as on the Mac.
 // Passthrough scales trackpad deltas back down and replays them evenly, once
-// per display frame. A real mouse wheel (whole notches), Ctrl+wheel zoom and
-// windows we can't inject into are left alone.
+// per display frame. Moonlight also caps each event at one notch, so every
+// swipe above a modest speed arrives alike; flicks that stay at the cap
+// longer get a longer momentum glide. A real mouse wheel (whole notches),
+// Ctrl+wheel zoom and windows we can't inject into are left alone.
 //
 // Passthrough works through a low-level mouse hook, so it is only active
 // while the tray app runs. Settings are saved under
@@ -56,6 +58,17 @@
 #define GLIDE_TAU 0.025   // seconds; smoothing of the replayed deltas
 #define GESTURE_MS 150    // whole notches this soon after a trackpad delta
                           // belong to the same swipe
+
+// Momentum stretch after a run of events at Moonlight's cap (see
+// stretch_tail). Runs shorter than CAP_MIN_MS are left alone; beyond that,
+// each extra second lets the tail run TAIL_GAIN more times ahead of the
+// Mac's own momentum, up to TAIL_MAX, fading with TAIL_FADE.
+#define CAP_MIN_MS 500
+#define TAIL_GAIN 8.0
+#define TAIL_MAX 10.0
+#define TAIL_FADE 2.0     // seconds
+#define DIP_MS 80         // dips under the cap this short don't end a run
+#define SWIPE_GAP_MS 150  // a pause this long starts a new swipe
 #define SPEED_DEFAULT 100 // percent
 #define SPEED_MIN 10
 #define SPEED_MAX 500
@@ -268,6 +281,47 @@ static BOOL from_trackpad(int delta, DWORD time)
     return TRUE;
 }
 
+// Moonlight caps each event at one notch, so how fast the fingers moved above
+// that is lost; what survives is how long the stream stays at the cap, which
+// grows with a harder flick. After a long capped run, the momentum tail that
+// follows fades more slowly than the Mac's own, but never runs more than
+// TAIL_MAX times ahead of it. It never speeds up, ends with the Mac's
+// momentum, and stops when you touch the trackpad. Returns the delta to use.
+static double stretch_tail(enum axis axis, int delta, DWORD time)
+{
+    static struct tail {
+        DWORD last, run_start, run_end; // run_end 0: no capped run this swipe
+        int prev;                       // previous delta, 0 at a swipe's start
+        double held;                    // stretched size, 0 when not stretching
+    } tails[2];
+    struct tail *t = &tails[axis];
+    DWORD dt = time - t->last;
+
+    if (dt > SWIPE_GAP_MS || (t->prev && (delta < 0) != (t->prev < 0))) {
+        t->run_end = 0; // a new swipe, or a reversal
+        t->held = 0;
+        t->prev = 0;
+    }
+    t->last = time;
+
+    int size = abs(delta), prev = abs(t->prev);
+    if (size >= WHEEL_DELTA) { // at the cap
+        if (!t->run_end || time - t->run_end > DIP_MS)
+            t->run_start = time;
+        t->run_end = time;
+        t->held = size;
+    } else if (size > prev + max(6, prev / 10)) {
+        t->held = 0; // rising again: that's fingers, not momentum
+    } else if (t->held) {
+        double run = (double)(t->run_end - t->run_start) - CAP_MIN_MS;
+        double most = fmin(TAIL_MAX, 1 + TAIL_GAIN * run / 1000);
+        double fade = exp(-(dt / 1000.0) / TAIL_FADE);
+        t->held = most > 1 ? fmin(size * most, fmax(size, t->held * fade)) : 0;
+    }
+    t->prev = delta;
+    return t->held > size ? copysign(t->held, delta) : delta;
+}
+
 // Returns TRUE if it took the event over (the hook then swallows it).
 static BOOL passthrough_wheel(enum axis axis, int delta,
                               const MSLLHOOKSTRUCT *ms)
@@ -280,7 +334,7 @@ static BOOL passthrough_wheel(enum axis axis, int delta,
     }
     if (out_of_reach(ms->pt))
         return FALSE;
-    glide_push(axis, delta * GAIN * speed / 100);
+    glide_push(axis, stretch_tail(axis, delta, ms->time) * GAIN * speed / 100);
     return TRUE;
 }
 

@@ -18,13 +18,22 @@ on the Mac. Passthrough:
 
 - scales trackpad deltas down 5×, so swipes move roughly as far as on the Mac;
 - replays them evenly once per display frame, smoothing out network jitter;
+- lets hard flicks glide farther (see below);
 - leaves a real mouse wheel (whole notches), Ctrl+wheel zoom and windows it
   can't inject into (elevated apps such as Task Manager) untouched.
 
-Moonlight also clamps each event to one notch, so very fast flicks come out
-a little shorter than on the Mac. If the speed doesn't feel right, pick
-another value under **Passthrough speed** in the tray menu, or run
-`scroll-options speed 150`.
+Moonlight also clamps each event to one notch, so every swipe faster than a
+gentle one reaches Windows as the same capped events: how fast your fingers
+moved above that is lost, and a fast swipe starts at the same speed as a
+medium one. What still gets through is how long the events stay at the cap,
+which grows the harder you flick. When that lasts over half a second, the
+momentum that follows fades more slowly than the Mac's own, so harder flicks
+glide farther. It never speeds up mid-glide, ends with the Mac's momentum,
+and touching the trackpad still stops it. Swipes that don't stay at the cap
+that long are unchanged.
+
+If the speed doesn't feel right, pick another value under **Passthrough
+speed** in the tray menu, or run `scroll-options speed 150`.
 
 Passthrough works through a low-level mouse hook, so it's only active while
 the tray app is running. Settings are saved under
