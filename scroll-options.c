@@ -1,24 +1,26 @@
-// scroll-options: tray utility that picks how Windows handles the mouse wheel.
+// scroll-options: tray utility for scrolling on a Windows PC you stream to
+// from a Mac with Moonlight/Sunshine.
 //
-//   discrete     native notch-by-notch scrolling (the Windows default);
-//                high-resolution input such as a trackpad is rounded to
-//                whole notches
-//   smooth       macOS-like: each notch glides to a stop and quick flicks
-//                accelerate; high-resolution input is left as is
-//   passthrough  don't touch wheel input at all, e.g. so a Mac trackpad
-//                streamed through Moonlight/Sunshine scrolls exactly as on
-//                the Mac
+//   native       leave Windows alone: no hook, no settings changed
+//   passthrough  make the Mac's trackpad scroll the way it does on the Mac
 //
-// discrete and smooth work through a low-level mouse hook, so they are only
-// active while the tray app runs. The mode is saved under
+// Moonlight on macOS sends one wheel notch (120) per ~10 pt of trackpad
+// scrolling, and Windows apps scroll three lines (~100 px in a browser) per
+// notch, so a slow swipe travels about ten times as far as on the Mac.
+// Passthrough scales trackpad deltas back down and replays them evenly, once
+// per display frame. A real mouse wheel (whole notches), Ctrl+wheel zoom and
+// windows we can't inject into are left alone.
+//
+// Passthrough works through a low-level mouse hook, so it is only active
+// while the tray app runs. Settings are saved under
 // HKCU\Software\scroll-options and restored when the tray app starts.
 //
-//   scroll-options.exe               run in the system tray
-//   scroll-options.exe discrete      switch to discrete scrolling
-//   scroll-options.exe smooth        switch to smooth scrolling
-//   scroll-options.exe passthrough   leave wheel input alone
-//   scroll-options.exe toggle        switch between smooth and discrete
-//   scroll-options.exe status        print current mode
+//   scroll-options.exe                  run in the system tray
+//   scroll-options.exe native           leave scrolling alone
+//   scroll-options.exe passthrough      Mac trackpad over Moonlight/Sunshine
+//   scroll-options.exe toggle           switch between native and passthrough
+//   scroll-options.exe speed [percent]  print or set the passthrough speed
+//   scroll-options.exe status           print current mode
 
 #define WIN32_LEAN_AND_MEAN
 #ifndef UNICODE
@@ -33,41 +35,48 @@
 #include <dwmapi.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define APP_NAME L"scroll-options"
 #define REG_KEY L"Software\\scroll-options"
 #define WM_TRAY (WM_APP + 1)
-#define WM_RELOAD (WM_APP + 2) // CLI saved a new mode
-#define WM_EMIT (WM_APP + 3)   // discrete mode: inject whole notches
+#define WM_RELOAD (WM_APP + 2) // CLI saved new settings
 #define ID_MODE 1              // menu ids ID_MODE + enum mode
-#define ID_EXIT 10
+#define ID_SPEED 10            // menu ids ID_SPEED + index into speeds
+#define ID_EXIT 20
 
 // Marks wheel events we inject so the hook lets them through.
 #define INJECTED_TAG ((ULONG_PTR)0x5C0110F7)
 
-// Smooth scrolling feel.
-#define GLIDE_TAU 0.09    // seconds; time constant of the ease-out
-#define FLICK_MS 150      // notches closer than this accelerate
-#define FLICK_GAIN 0.35   // extra distance per consecutive flick notch
-#define FLICK_MAX 8       // cap on consecutive flick notches
+// Passthrough feel: wheel units out per unit in, at 100% speed. Moonlight
+// sends ~12 units per pt of Mac trackpad scrolling, which a browser turns
+// into ~10 px; 0.2 brings slow swipes to ~2 px per pt and, since Moonlight
+// clamps fast events to one notch, flicks with momentum to about 1:1.
+#define GAIN 0.2
+#define GLIDE_TAU 0.025   // seconds; smoothing of the replayed deltas
+#define GESTURE_MS 150    // whole notches this soon after a trackpad delta
+                          // belong to the same swipe
+#define SPEED_DEFAULT 100 // percent
+#define SPEED_MIN 10
+#define SPEED_MAX 500
 
-enum mode { MODE_DISCRETE, MODE_SMOOTH, MODE_PASSTHROUGH, MODE_COUNT };
+enum mode { MODE_NATIVE, MODE_PASSTHROUGH, MODE_COUNT };
 enum axis { AXIS_V, AXIS_H };
 
-static const wchar_t *mode_names[MODE_COUNT] = {
-    L"discrete", L"smooth", L"passthrough",
-};
+static const wchar_t *mode_names[MODE_COUNT] = {L"native", L"passthrough"};
 static const wchar_t *mode_labels[MODE_COUNT] = {
-    L"Discrete (Windows default)",
-    L"Smooth (macOS-like)",
-    L"Passthrough (leave input alone)",
+    L"Native Windows (no changes)",
+    L"Passthrough (Mac trackpad over Moonlight)",
 };
+static const int speeds[] = {50, 75, 100, 150, 200}; // menu presets
+#define SPEED_COUNT ((int)ARRAYSIZE(speeds))
 
 static NOTIFYICONDATAW nid;
 static UINT wm_taskbar_created;
-static HWND tray_hwnd;
 static HHOOK hook;
-static enum mode mode = MODE_PASSTHROUGH;
+static enum mode mode = MODE_NATIVE;
+static int speed = SPEED_DEFAULT;
+static DWORD own_integrity;
 
 // ---- settings -------------------------------------------------------------
 
@@ -80,23 +89,46 @@ static enum mode load_mode(void)
         for (int m = 0; m < MODE_COUNT; m++)
             if (!lstrcmpiW(buf, mode_names[m]))
                 return m;
-    return MODE_DISCRETE;
+    return MODE_NATIVE;
+}
+
+static int load_speed(void)
+{
+    DWORD v, size = sizeof v;
+    if (RegGetValueW(HKEY_CURRENT_USER, REG_KEY, L"Speed", RRF_RT_REG_DWORD,
+                     NULL, &v, &size) == ERROR_SUCCESS &&
+        v >= SPEED_MIN && v <= SPEED_MAX)
+        return v;
+    return SPEED_DEFAULT;
+}
+
+static BOOL save_value(const wchar_t *name, DWORD type, const void *data,
+                       DWORD size)
+{
+    HKEY key;
+    LSTATUS rc = RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0,
+                                 KEY_SET_VALUE, NULL, &key, NULL);
+    if (rc == ERROR_SUCCESS) {
+        rc = RegSetValueExW(key, name, 0, type, data, size);
+        RegCloseKey(key);
+    }
+    SetLastError(rc);
+    return rc == ERROR_SUCCESS;
 }
 
 static BOOL save_mode(enum mode m)
 {
-    HKEY key;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0, KEY_SET_VALUE,
-                        NULL, &key, NULL) != ERROR_SUCCESS)
-        return FALSE;
     const wchar_t *s = mode_names[m];
-    LSTATUS rc = RegSetValueExW(key, L"Mode", 0, REG_SZ, (const BYTE *)s,
-                                (lstrlenW(s) + 1) * sizeof *s);
-    RegCloseKey(key);
-    return rc == ERROR_SUCCESS;
+    return save_value(L"Mode", REG_SZ, s, (lstrlenW(s) + 1) * sizeof *s);
 }
 
-// ---- wheel ----------------------------------------------------------------
+static BOOL save_speed(int percent)
+{
+    DWORD v = percent;
+    return save_value(L"Speed", REG_DWORD, &v, sizeof v);
+}
+
+// ---- passthrough ----------------------------------------------------------
 
 static CRITICAL_SECTION glide_lock;
 static HANDLE glide_wake;
@@ -120,30 +152,19 @@ static void glide_cancel(void)
     LeaveCriticalSection(&glide_lock);
 }
 
-static void glide_push(enum axis axis, int delta)
+static void glide_push(enum axis axis, double delta)
 {
-    static DWORD last_tick[2];
-    static int last_sign[2], streak[2];
-    DWORD now = GetTickCount();
-    int sign = delta > 0 ? 1 : -1;
-
-    if (sign != last_sign[axis] || now - last_tick[axis] > FLICK_MS)
-        streak[axis] = 0;
-    else if (streak[axis] < FLICK_MAX)
-        streak[axis]++;
-    last_sign[axis] = sign;
-    last_tick[axis] = now;
-
     EnterCriticalSection(&glide_lock);
-    if (glide_left[axis] * sign < 0) // reversed: drop the old glide
+    if (glide_left[axis] * delta < 0) // reversed: drop the old glide
         glide_left[axis] = glide_carry[axis] = 0;
-    glide_left[axis] += delta * (1 + FLICK_GAIN * streak[axis]);
+    glide_left[axis] += delta;
     LeaveCriticalSection(&glide_lock);
     SetEvent(glide_wake);
 }
 
-// Animates pending glides one display frame at a time with an exponential
+// Replays pending deltas one display frame at a time with an exponential
 // ease-out, injecting the distance covered as high-resolution wheel deltas.
+// This also evens out deltas that arrive in bursts from the network.
 static DWORD WINAPI glide_thread(LPVOID arg)
 {
     (void)arg;
@@ -178,8 +199,11 @@ static DWORD WINAPI glide_thread(LPVOID arg)
                                                       : glide_left[a] * k;
                 glide_left[a] -= step;
                 glide_carry[a] += step;
-                out[a] = glide_left[a] ? (int)glide_carry[a]
-                                       : (int)lround(glide_carry[a]);
+                // An idle axis keeps its rounding remainder for later; rounding
+                // it every frame could flip a carry of 0.5 back and forth.
+                out[a] = !step          ? 0
+                         : glide_left[a] ? (int)glide_carry[a]
+                                         : (int)lround(glide_carry[a]);
                 glide_carry[a] -= out[a];
                 if (glide_left[a])
                     active = TRUE;
@@ -194,38 +218,69 @@ static DWORD WINAPI glide_thread(LPVOID arg)
     return 0;
 }
 
-// Each returns TRUE if it took the event over (the hook then swallows it).
-
-static BOOL smooth_wheel(enum axis axis, int delta)
+static DWORD integrity_of(HANDLE process)
 {
-    if (delta % WHEEL_DELTA) // already high-resolution (trackpad, free-spin)
-        return FALSE;
-    if (GetAsyncKeyState(VK_CONTROL) < 0) { // keep zoom in whole steps
-        glide_cancel();
-        return FALSE;
+    DWORD rid = SECURITY_MANDATORY_SYSTEM_RID; // unknown: assume it's above us
+    HANDLE token;
+    if (process && OpenProcessToken(process, TOKEN_QUERY, &token)) {
+        union { TOKEN_MANDATORY_LABEL label; BYTE buf[64]; } info;
+        DWORD len;
+        if (GetTokenInformation(token, TokenIntegrityLevel, &info, sizeof info,
+                                &len)) {
+            PSID sid = info.label.Label.Sid;
+            rid = *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1);
+        }
+        CloseHandle(token);
     }
-    glide_push(axis, delta);
+    return rid;
+}
+
+// SendInput can't reach windows of a higher integrity level (UIPI), such as
+// an elevated Task Manager, so their wheel input has to be left alone.
+static BOOL out_of_reach(POINT pt)
+{
+    static DWORD last_pid, last_rid;
+    DWORD routing = MOUSEWHEEL_ROUTING_FOCUS, pid = 0;
+    SystemParametersInfoW(SPI_GETMOUSEWHEELROUTING, 0, &routing, 0);
+    HWND target = routing == MOUSEWHEEL_ROUTING_MOUSE_POS
+                      ? WindowFromPoint(pt)
+                      : GetForegroundWindow();
+    if (!target || !GetWindowThreadProcessId(target, &pid))
+        return FALSE;
+    if (pid != last_pid) {
+        HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        last_rid = integrity_of(p);
+        if (p)
+            CloseHandle(p);
+        last_pid = pid;
+    }
+    return last_rid > own_integrity;
+}
+
+// Moonlight forwards a mouse wheel as whole notches and a trackpad as
+// arbitrary deltas, though fast swipes get clamped to whole notches too.
+static BOOL from_trackpad(int delta, DWORD time)
+{
+    static DWORD last;
+    if (delta % WHEEL_DELTA == 0 && time - last > GESTURE_MS)
+        return FALSE;
+    last = time;
     return TRUE;
 }
 
-static BOOL discrete_wheel(enum axis axis, int delta)
+// Returns TRUE if it took the event over (the hook then swallows it).
+static BOOL passthrough_wheel(enum axis axis, int delta,
+                              const MSLLHOOKSTRUCT *ms)
 {
-    static int acc[2];
-    static DWORD last_tick[2];
-    DWORD now = GetTickCount();
-
-    // After a pause or a reversal, drop the leftover partial notch.
-    if (now - last_tick[axis] > 400 || (acc[axis] ^ delta) < 0)
-        acc[axis] = 0;
-    last_tick[axis] = now;
-    if (!acc[axis] && delta % WHEEL_DELTA == 0) // a real notch
+    if (!from_trackpad(delta, ms->time))
         return FALSE;
-
-    acc[axis] += delta;
-    int notches = acc[axis] / WHEEL_DELTA;
-    acc[axis] -= notches * WHEEL_DELTA;
-    if (notches) // inject outside the hook callback
-        PostMessageW(tray_hwnd, WM_EMIT, axis, notches * WHEEL_DELTA);
+    if (GetAsyncKeyState(VK_CONTROL) < 0) { // leave Ctrl+wheel zoom as is
+        glide_cancel();
+        return FALSE;
+    }
+    if (out_of_reach(ms->pt))
+        return FALSE;
+    glide_push(axis, delta * GAIN * speed / 100);
     return TRUE;
 }
 
@@ -236,8 +291,7 @@ static LRESULT CALLBACK mouse_hook(int code, WPARAM wp, LPARAM lp)
         enum axis axis = wp == WM_MOUSEHWHEEL ? AXIS_H : AXIS_V;
         int delta = GET_WHEEL_DELTA_WPARAM(ms->mouseData);
         if (ms->dwExtraInfo != INJECTED_TAG && delta &&
-            (mode == MODE_SMOOTH ? smooth_wheel(axis, delta)
-                                 : discrete_wheel(axis, delta)))
+            passthrough_wheel(axis, delta, ms))
             return 1;
     }
     return CallNextHookEx(NULL, code, wp, lp);
@@ -249,7 +303,7 @@ static void tray_update(void)
 {
     wchar_t tip[64];
     wsprintfW(tip, L"Scroll Options: %s%s", mode_names[mode],
-              mode != MODE_PASSTHROUGH && !hook ? L" (hook failed)" : L"");
+              mode == MODE_PASSTHROUGH && !hook ? L" (hook failed)" : L"");
     lstrcpynW(nid.szTip, tip, ARRAYSIZE(nid.szTip));
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
@@ -259,21 +313,13 @@ static void apply_mode(enum mode m)
     mode = m;
     glide_cancel();
 
-    if (m == MODE_PASSTHROUGH) {
+    if (m == MODE_NATIVE) {
         if (hook)
             UnhookWindowsHookEx(hook);
         hook = NULL;
-    } else {
-        if (!hook)
-            hook = SetWindowsHookExW(WH_MOUSE_LL, mouse_hook,
-                                     GetModuleHandleW(NULL), 0);
-        // Match the "Smooth-scroll list boxes" visual effect to the mode.
-        BOOL want = m == MODE_SMOOTH, on = FALSE;
-        SystemParametersInfoW(SPI_GETLISTBOXSMOOTHSCROLLING, 0, &on, 0);
-        if (!on != !want)
-            SystemParametersInfoW(SPI_SETLISTBOXSMOOTHSCROLLING, 0,
-                                  (PVOID)(INT_PTR)want,
-                                  SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+    } else if (!hook) {
+        hook = SetWindowsHookExW(WH_MOUSE_LL, mouse_hook,
+                                 GetModuleHandleW(NULL), 0);
     }
     tray_update();
 }
@@ -292,9 +338,20 @@ static void tray_add(HWND hwnd)
 
 static void show_menu(HWND hwnd)
 {
-    HMENU m = CreatePopupMenu();
+    HMENU m = CreatePopupMenu(), speed_menu = CreatePopupMenu();
+    for (int i = 0; i < SPEED_COUNT; i++) {
+        wchar_t label[16];
+        wsprintfW(label, L"%d%%", speeds[i]);
+        AppendMenuW(speed_menu, MF_STRING, ID_SPEED + i, label);
+    }
+    for (int i = 0; i < SPEED_COUNT; i++)
+        if (speeds[i] == speed)
+            CheckMenuRadioItem(speed_menu, ID_SPEED, ID_SPEED + SPEED_COUNT - 1,
+                               ID_SPEED + i, MF_BYCOMMAND);
+
     for (int i = 0; i < MODE_COUNT; i++)
         AppendMenuW(m, MF_STRING, ID_MODE + i, mode_labels[i]);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)speed_menu, L"Passthrough speed");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
     CheckMenuRadioItem(m, ID_MODE, ID_MODE + MODE_COUNT - 1, ID_MODE + mode,
@@ -305,7 +362,7 @@ static void show_menu(HWND hwnd)
     SetForegroundWindow(hwnd); // required so the menu closes on outside click
     TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
     PostMessageW(hwnd, WM_NULL, 0, 0);
-    DestroyMenu(m);
+    DestroyMenu(m); // also destroys speed_menu
 }
 
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -320,16 +377,17 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (id >= ID_MODE && id < ID_MODE + MODE_COUNT) {
             save_mode(id - ID_MODE);
             apply_mode(id - ID_MODE);
+        } else if (id >= ID_SPEED && id < ID_SPEED + SPEED_COUNT) {
+            speed = speeds[id - ID_SPEED];
+            save_speed(speed);
         } else if (id == ID_EXIT) {
             DestroyWindow(hwnd);
         }
         return 0;
     }
     case WM_RELOAD:
+        speed = load_speed();
         apply_mode(load_mode());
-        return 0;
-    case WM_EMIT:
-        inject_wheel(wp, (int)lp);
         return 0;
     case WM_DESTROY:
         if (hook)
@@ -360,16 +418,18 @@ static int run_tray(HINSTANCE inst)
     RegisterClassW(&wc);
 
     // Hidden top-level window so the CLI can find it by class name.
-    tray_hwnd = CreateWindowExW(0, APP_NAME, APP_NAME, 0, 0, 0, 0, 0,
+    HWND hwnd = CreateWindowExW(0, APP_NAME, APP_NAME, 0, 0, 0, 0, 0,
                                 NULL, NULL, inst, NULL);
-    if (!tray_hwnd)
+    if (!hwnd)
         return 1;
 
+    own_integrity = integrity_of(GetCurrentProcess());
     InitializeCriticalSection(&glide_lock);
     glide_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
     CloseHandle(CreateThread(NULL, 0, glide_thread, NULL, 0, NULL));
 
-    tray_add(tray_hwnd);
+    tray_add(hwnd);
+    speed = load_speed();
     apply_mode(load_mode());
 
     MSG msg;
@@ -393,30 +453,64 @@ static void attach_console(void)
     }
 }
 
+// Tells a running tray app to pick up saved settings; returns its window.
+static HWND reload_tray(void)
+{
+    HWND tray = FindWindowW(APP_NAME, NULL);
+    if (tray)
+        PostMessageW(tray, WM_RELOAD, 0, 0);
+    return tray;
+}
+
 static int set_mode_cli(enum mode m)
 {
     if (!save_mode(m)) {
         fprintf(stderr, "error: failed to save setting (%lu)\n", GetLastError());
         return 1;
     }
-    HWND tray = FindWindowW(APP_NAME, NULL);
-    if (tray)
-        PostMessageW(tray, WM_RELOAD, 0, 0);
+    HWND tray = reload_tray();
     printf("%ls\n", mode_names[m]);
-    if (!tray && m != MODE_PASSTHROUGH)
+    if (!tray && m != MODE_NATIVE)
         fprintf(stderr, "note: takes effect once the tray app is running\n");
     return 0;
 }
 
-static int run_cli(const wchar_t *cmd)
+static int set_speed_cli(const wchar_t *arg)
 {
+    wchar_t *end;
+    long v = wcstol(arg, &end, 10);
+    if (*end == L'%')
+        end++;
+    if (end == arg || *end || v < SPEED_MIN || v > SPEED_MAX) {
+        fprintf(stderr, "error: speed must be a percentage from %d to %d\n",
+                SPEED_MIN, SPEED_MAX);
+        return 2;
+    }
+    if (!save_speed(v)) {
+        fprintf(stderr, "error: failed to save setting (%lu)\n", GetLastError());
+        return 1;
+    }
+    reload_tray();
+    printf("%ld%%\n", v);
+    return 0;
+}
+
+static int run_cli(int argc, wchar_t **argv)
+{
+    const wchar_t *cmd = argv[1];
     attach_console();
     for (int m = 0; m < MODE_COUNT; m++)
         if (!lstrcmpiW(cmd, mode_names[m]))
             return set_mode_cli(m);
     if (!lstrcmpiW(cmd, L"toggle"))
-        return set_mode_cli(load_mode() == MODE_SMOOTH ? MODE_DISCRETE
-                                                       : MODE_SMOOTH);
+        return set_mode_cli(load_mode() == MODE_PASSTHROUGH ? MODE_NATIVE
+                                                            : MODE_PASSTHROUGH);
+    if (!lstrcmpiW(cmd, L"speed")) {
+        if (argc > 2)
+            return set_speed_cli(argv[2]);
+        printf("%d%%\n", load_speed());
+        return 0;
+    }
     if (!lstrcmpiW(cmd, L"status")) {
         printf("%ls\n", mode_names[load_mode()]);
         return 0;
@@ -425,13 +519,13 @@ static int run_cli(const wchar_t *cmd)
     BOOL help = !lstrcmpiW(cmd, L"help") || !lstrcmpiW(cmd, L"-h") ||
                 !lstrcmpiW(cmd, L"--help") || !lstrcmpiW(cmd, L"/?");
     fprintf(help ? stdout : stderr,
-            "usage: scroll-options [discrete | smooth | passthrough | toggle | status]\n"
-            "  (no arguments)  run in the system tray\n"
-            "  discrete        notch-by-notch scrolling (Windows default)\n"
-            "  smooth          macOS-like smooth scrolling\n"
-            "  passthrough     leave wheel input alone (e.g. Moonlight/Sunshine)\n"
-            "  toggle          switch between smooth and discrete\n"
-            "  status          print current mode\n");
+            "usage: scroll-options [native | passthrough | toggle | speed [percent] | status]\n"
+            "  (no arguments)   run in the system tray\n"
+            "  native           leave Windows scrolling alone\n"
+            "  passthrough      Mac trackpad over Moonlight/Sunshine scrolls like on the Mac\n"
+            "  toggle           switch between native and passthrough\n"
+            "  speed [percent]  print or set the passthrough speed (default 100)\n"
+            "  status           print current mode\n");
     return help ? 0 : 2;
 }
 
@@ -441,7 +535,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
 
     int argc;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    int rc = (argv && argc > 1) ? run_cli(argv[1]) : run_tray(inst);
+    int rc = (argv && argc > 1) ? run_cli(argc, argv) : run_tray(inst);
     LocalFree(argv);
     return rc;
 }
