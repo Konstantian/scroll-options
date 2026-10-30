@@ -2,6 +2,7 @@
 // from a Mac with Moonlight/Sunshine.
 //
 //   native       leave Windows alone: no hook, no settings changed
+//   auto         passthrough for input from Sunshine, native for local mice
 //   passthrough  make the Mac's trackpad scroll the way it does on the Mac
 //
 // Moonlight on macOS sends one wheel notch (120) per ~10 pt of trackpad
@@ -11,12 +12,20 @@
 // per display frame. A real mouse wheel (whole notches), Ctrl+wheel zoom and
 // windows we can't inject into are left alone.
 //
-// Passthrough works through a low-level mouse hook, so it is only active
+// Auto does the same, but only for wheel events Sunshine produced, so mice
+// plugged into the PC itself always scroll natively. Sunshine either injects
+// the client's mouse with SendInput, which flags the events as injected, or,
+// with its licensed virtual HID driver, through a virtual "libvirtualhid
+// Mouse". That one looks like hardware to the hook, so Raw Input tracks
+// whether it or a local mouse was used last.
+//
+// Passthrough and auto work through a low-level mouse hook, so it is only active
 // while the tray app runs. Settings are saved under
 // HKCU\Software\scroll-options and restored when the tray app starts.
 //
 //   scroll-options.exe                  run in the system tray
 //   scroll-options.exe native           leave scrolling alone
+//   scroll-options.exe auto             passthrough only for Sunshine input
 //   scroll-options.exe passthrough      Mac trackpad over Moonlight/Sunshine
 //   scroll-options.exe toggle           switch between native and passthrough
 //   scroll-options.exe status           print current mode
@@ -60,20 +69,27 @@
 #define GESTURE_MS 150    // whole notches this soon after a trackpad delta
                           // belong to the same swipe
 
-enum mode { MODE_NATIVE, MODE_PASSTHROUGH, MODE_COUNT };
+// Hardware ID of Sunshine's virtual mouse (libvirtualhid's mouse profile).
+#define SUNSHINE_MOUSE_ID L"VID_1209&PID_0003"
+
+enum mode { MODE_NATIVE, MODE_AUTO, MODE_PASSTHROUGH, MODE_COUNT };
 enum axis { AXIS_V, AXIS_H };
 
-static const wchar_t *mode_names[MODE_COUNT] = {L"native", L"passthrough"};
+static const wchar_t *mode_names[MODE_COUNT] = {L"native", L"auto",
+                                                L"passthrough"};
 static const wchar_t *mode_labels[MODE_COUNT] = {
     L"Native Windows (no changes)",
+    L"Auto (Moonlight only, local mice native)",
     L"Passthrough (Mac trackpad over Moonlight)",
 };
 
 static NOTIFYICONDATAW nid;
 static UINT wm_taskbar_created;
+static HWND tray_hwnd;
 static HHOOK hook;
 static enum mode mode = MODE_NATIVE;
 static DWORD own_integrity;
+static BOOL stream_mouse_last; // Sunshine's virtual mouse was used last
 
 // ---- settings -------------------------------------------------------------
 
@@ -260,6 +276,52 @@ static BOOL passthrough_wheel(enum axis axis, int delta,
     return TRUE;
 }
 
+// ---- auto -----------------------------------------------------------------
+
+static BOOL is_stream_mouse(HANDLE dev)
+{
+    static HANDLE last_dev;
+    static BOOL last_match;
+    if (dev != last_dev) {
+        wchar_t name[512];
+        UINT len = ARRAYSIZE(name);
+        UINT n = GetRawInputDeviceInfoW(dev, RIDI_DEVICENAME, name, &len);
+        last_match = n && n < ARRAYSIZE(name) && // (UINT)-1 on error
+                     wcsstr(CharUpperW(name), SUNSHINE_MOUSE_ID);
+        last_dev = dev;
+    }
+    return last_match;
+}
+
+// Raw input from every mouse, even while we're in the background, to see
+// which one was used last. Injected input has no device and doesn't count.
+static void watch_mice(BOOL on)
+{
+    RAWINPUTDEVICE rid = {0x01, 0x02, on ? RIDEV_INPUTSINK : RIDEV_REMOVE,
+                          on ? tray_hwnd : NULL};
+    RegisterRawInputDevices(&rid, 1, sizeof rid);
+    stream_mouse_last = FALSE;
+}
+
+static void raw_input(HRAWINPUT ri)
+{
+    RAWINPUTHEADER h;
+    UINT size = sizeof h;
+    if (GetRawInputData(ri, RID_HEADER, &h, &size, sizeof h) == sizeof h &&
+        h.hDevice)
+        stream_mouse_last = is_stream_mouse(h.hDevice);
+}
+
+// Whether a wheel event came from the Moonlight client. Windows may run the
+// hook before or after the event's raw input arrives, so the first event
+// after switching mice can be misjudged; local wheels send whole notches,
+// which passthrough leaves alone anyway. Other programs that inject wheel
+// input would count as Sunshine too.
+static BOOL from_stream(const MSLLHOOKSTRUCT *ms)
+{
+    return (ms->flags & LLMHF_INJECTED) || stream_mouse_last;
+}
+
 static LRESULT CALLBACK mouse_hook(int code, WPARAM wp, LPARAM lp)
 {
     if (code == HC_ACTION && (wp == WM_MOUSEWHEEL || wp == WM_MOUSEHWHEEL)) {
@@ -267,6 +329,7 @@ static LRESULT CALLBACK mouse_hook(int code, WPARAM wp, LPARAM lp)
         enum axis axis = wp == WM_MOUSEHWHEEL ? AXIS_H : AXIS_V;
         int delta = GET_WHEEL_DELTA_WPARAM(ms->mouseData);
         if (ms->dwExtraInfo != INJECTED_TAG && delta &&
+            (mode != MODE_AUTO || from_stream(ms)) &&
             passthrough_wheel(axis, delta, ms))
             return 1;
     }
@@ -279,7 +342,7 @@ static void tray_update(void)
 {
     wchar_t tip[64];
     wsprintfW(tip, L"Scroll Options: %s%s", mode_names[mode],
-              mode == MODE_PASSTHROUGH && !hook ? L" (hook failed)" : L"");
+              mode != MODE_NATIVE && !hook ? L" (hook failed)" : L"");
     lstrcpynW(nid.szTip, tip, ARRAYSIZE(nid.szTip));
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
@@ -288,6 +351,7 @@ static void apply_mode(enum mode m)
 {
     mode = m;
     glide_cancel();
+    watch_mice(m == MODE_AUTO);
 
     if (m == MODE_NATIVE) {
         if (hook)
@@ -351,6 +415,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_RELOAD:
         apply_mode(load_mode());
         return 0;
+    case WM_INPUT:
+        raw_input((HRAWINPUT)lp);
+        break; // DefWindowProc frees the input
     case WM_DESTROY:
         if (hook)
             UnhookWindowsHookEx(hook);
@@ -384,6 +451,7 @@ static int run_tray(HINSTANCE inst)
                                 NULL, NULL, inst, NULL);
     if (!hwnd)
         return 1;
+    tray_hwnd = hwnd;
 
     own_integrity = integrity_of(GetCurrentProcess());
     InitializeCriticalSection(&glide_lock);
@@ -444,8 +512,8 @@ static int run_cli(wchar_t **argv)
         if (!lstrcmpiW(cmd, mode_names[m]))
             return set_mode_cli(m);
     if (!lstrcmpiW(cmd, L"toggle"))
-        return set_mode_cli(load_mode() == MODE_PASSTHROUGH ? MODE_NATIVE
-                                                            : MODE_PASSTHROUGH);
+        return set_mode_cli(load_mode() != MODE_NATIVE ? MODE_NATIVE
+                                                       : MODE_PASSTHROUGH);
     if (!lstrcmpiW(cmd, L"version") || !lstrcmpiW(cmd, L"--version")) {
         printf("scroll-options %s\n", VERSION);
         return 0;
@@ -458,11 +526,12 @@ static int run_cli(wchar_t **argv)
     BOOL help = !lstrcmpiW(cmd, L"help") || !lstrcmpiW(cmd, L"-h") ||
                 !lstrcmpiW(cmd, L"--help") || !lstrcmpiW(cmd, L"/?");
     fprintf(help ? stdout : stderr,
-            "usage: scroll-options [native | passthrough | toggle | status | version]\n"
+            "usage: scroll-options [native | auto | passthrough | toggle | status | version]\n"
             "  (no arguments)   run in the system tray\n"
             "  native           leave Windows scrolling alone\n"
+            "  auto             passthrough for Sunshine input, local mice untouched\n"
             "  passthrough      Mac trackpad over Moonlight/Sunshine scrolls like on the Mac\n"
-            "  toggle           switch between native and passthrough\n"
+            "  toggle           switch to native, or from native to passthrough\n"
             "  status           print current mode\n"
             "  version          print the version\n");
     return help ? 0 : 2;
