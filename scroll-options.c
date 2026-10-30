@@ -367,6 +367,29 @@ static BOOL passthrough_wheel(enum axis axis, int delta,
 // scrolls at a low speed still add up. Only the hook thread touches these.
 static double scaled_carry[2];
 
+// SendInput can't be called from inside the hook: the injected event goes
+// through the same hook on the same thread, so all mouse input stalls until
+// Windows times the hook out. A worker thread injects instead.
+static CRITICAL_SECTION scaled_lock;
+static HANDLE scaled_wake;
+static int scaled_out[2]; // whole wheel units waiting to be injected
+
+static DWORD WINAPI scaled_thread(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        WaitForSingleObject(scaled_wake, INFINITE);
+        EnterCriticalSection(&scaled_lock);
+        int out[2] = {scaled_out[0], scaled_out[1]};
+        scaled_out[0] = scaled_out[1] = 0;
+        LeaveCriticalSection(&scaled_lock);
+        for (int a = 0; a < 2; a++)
+            if (out[a])
+                inject_wheel(a, out[a]);
+    }
+    return 0;
+}
+
 // Returns TRUE if it took the event over (the hook then swallows it).
 static BOOL scaled_wheel(enum axis axis, int delta, const MSLLHOOKSTRUCT *ms)
 {
@@ -378,8 +401,12 @@ static BOOL scaled_wheel(enum axis axis, int delta, const MSLLHOOKSTRUCT *ms)
     scaled_carry[axis] += delta * speed / 100.0;
     int out = (int)scaled_carry[axis];
     scaled_carry[axis] -= out;
-    if (out)
-        inject_wheel(axis, out);
+    if (out) {
+        EnterCriticalSection(&scaled_lock);
+        scaled_out[axis] += out;
+        LeaveCriticalSection(&scaled_lock);
+        SetEvent(scaled_wake);
+    }
     return TRUE;
 }
 
@@ -616,6 +643,9 @@ static int run_tray(HINSTANCE inst)
     InitializeCriticalSection(&glide_lock);
     glide_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
     CloseHandle(CreateThread(NULL, 0, glide_thread, NULL, 0, NULL));
+    InitializeCriticalSection(&scaled_lock);
+    scaled_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    CloseHandle(CreateThread(NULL, 0, scaled_thread, NULL, 0, NULL));
 
     tray_add(hwnd);
     apply_mode(load_mode());
