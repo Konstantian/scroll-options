@@ -17,7 +17,9 @@ notch. Without help, a slow swipe travels about ten times as far as it does
 on the Mac. Passthrough:
 
 - scales trackpad deltas down 5×, so swipes move roughly as far as on the Mac;
-- replays them evenly once per display frame, smoothing out network jitter;
+- replays them once per display frame on a spring that eases the speed in
+  and out, so network jitter doesn't make swipes and momentum choppy (this
+  adds about 15 ms of delay);
 - lets hard flicks glide farther (see below);
 - leaves a real mouse wheel (whole notches), Ctrl+wheel zoom and windows it
   can't inject into (elevated apps such as Task Manager) untouched.
@@ -45,6 +47,10 @@ Things on the Windows side that still affect the feel:
   fingers. For the most direct feel, turn smooth scrolling off:
   `chrome://flags/#smooth-scrolling`, `edge://flags/#smooth-scrolling`, or in
   Firefox, Settings → General → Use smooth scrolling.
+- If dragging a window around also looks choppy in the stream, the cause is
+  the video's frame pacing rather than scrolling: turn on **V-Sync** and
+  **Frame pacing** in Moonlight's settings and stream at the host display's
+  refresh rate.
 - Sunshine's **High resolution scrolling** option has to stay on (the
   default). If Sunshine drives the mouse through its licensed Virtual HID
   Driver, it rounds scrolling to whole notches before Windows sees it, and

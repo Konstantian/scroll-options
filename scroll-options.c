@@ -55,7 +55,12 @@
 // into ~10 px; 0.2 brings slow swipes to ~2 px per pt and, since Moonlight
 // clamps fast events to one notch, flicks with momentum to about 1:1.
 #define GAIN 0.2
-#define GLIDE_TAU 0.025   // seconds; smoothing of the replayed deltas
+// Replay smoothing (see glide_step): the spring's time constant in seconds,
+// stretched to the average spacing of incoming events up to GLIDE_TAU_MAX so
+// sparse events don't leave stalls between them.
+#define GLIDE_TAU 0.020
+#define GLIDE_TAU_MAX 0.040
+#define GAP_AVG 0.1       // weight of each new event spacing in that average
 #define GESTURE_MS 150    // whole notches this soon after a trackpad delta
                           // belong to the same swipe
 
@@ -146,7 +151,9 @@ static BOOL save_speed(int percent)
 static CRITICAL_SECTION glide_lock;
 static HANDLE glide_wake;
 static double glide_left[2];  // wheel units still to scroll, per axis
+static double glide_vel[2];   // current scrolling speed, units per second
 static double glide_carry[2]; // fraction scrolled but not yet injected
+static double glide_gap[2];   // average seconds between incoming events
 
 static void inject_wheel(enum axis axis, int delta)
 {
@@ -161,23 +168,60 @@ static void inject_wheel(enum axis axis, int delta)
 static void glide_cancel(void)
 {
     EnterCriticalSection(&glide_lock);
-    glide_left[0] = glide_left[1] = glide_carry[0] = glide_carry[1] = 0;
+    for (int a = 0; a < 2; a++)
+        glide_left[a] = glide_vel[a] = glide_carry[a] = 0;
     LeaveCriticalSection(&glide_lock);
 }
 
-static void glide_push(enum axis axis, double delta)
+static void glide_push(enum axis axis, double delta, DWORD time)
 {
+    static DWORD last[2];
+    DWORD gap = time - last[axis];
+    last[axis] = time;
+
     EnterCriticalSection(&glide_lock);
-    if (glide_left[axis] * delta < 0) // reversed: drop the old glide
-        glide_left[axis] = glide_carry[axis] = 0;
+    if (gap < SWIPE_GAP_MS) { // spacing of events within a swipe
+        double g = fmax(gap, 1) / 1000.0;
+        glide_gap[axis] += glide_gap[axis] ? GAP_AVG * (g - glide_gap[axis])
+                                           : g;
+    }
+    // Reversed: drop the old glide.
+    if (glide_left[axis] * delta < 0 || glide_vel[axis] * delta < 0)
+        glide_left[axis] = glide_vel[axis] = glide_carry[axis] = 0;
     glide_left[axis] += delta;
     LeaveCriticalSection(&glide_lock);
     SetEvent(glide_wake);
 }
 
-// Replays pending deltas one display frame at a time with an exponential
-// ease-out, injecting the distance covered as high-resolution wheel deltas.
-// This also evens out deltas that arrive in bursts from the network.
+// Moves one axis toward its target by dt seconds on a critically damped
+// spring, so the speed eases in and out instead of jumping with every event
+// that arrives, which evens out bursty network input. Returns the whole wheel
+// units to inject. Call with glide_lock held.
+static int glide_step(enum axis a, double dt)
+{
+    double w = 1 / fmin(GLIDE_TAU_MAX, fmax(GLIDE_TAU, glide_gap[a]));
+    double e = exp(-w * dt);
+    double x = -glide_left[a], v = glide_vel[a]; // position relative to target
+    double x1 = (x + (v + w * x) * dt) * e;
+    glide_vel[a] = (v - w * (v + w * x) * dt) * e;
+    glide_left[a] = -x1;
+    double step = x1 - x;
+    if (fabs(glide_left[a]) < 0.5 && fabs(glide_vel[a]) * dt < 0.25) {
+        step += glide_left[a]; // close enough: land on the target
+        glide_left[a] = glide_vel[a] = 0;
+    }
+    glide_carry[a] += step;
+    // An idle axis keeps its rounding remainder for later; rounding it every
+    // frame could flip a carry of 0.5 back and forth.
+    int out = !step          ? 0
+              : glide_left[a] ? (int)glide_carry[a]
+                              : (int)lround(glide_carry[a]);
+    glide_carry[a] -= out;
+    return out;
+}
+
+// Replays pending deltas once per display frame (see glide_step), injecting
+// the distance covered as high-resolution wheel deltas.
 static DWORD WINAPI glide_thread(LPVOID arg)
 {
     (void)arg;
@@ -198,7 +242,7 @@ static DWORD WINAPI glide_thread(LPVOID arg)
                 continue;
             }
             last = now;
-            double k = 1 - exp(-fmin(dt, 0.05) / GLIDE_TAU);
+            dt = fmin(dt, 0.05);
             // Don't let the tail of a glide turn into Ctrl+wheel zoom.
             BOOL ctrl = GetAsyncKeyState(VK_CONTROL) < 0;
             int out[2];
@@ -207,18 +251,9 @@ static DWORD WINAPI glide_thread(LPVOID arg)
             EnterCriticalSection(&glide_lock);
             for (int a = 0; a < 2; a++) {
                 if (ctrl)
-                    glide_left[a] = glide_carry[a] = 0;
-                double step = fabs(glide_left[a]) < 1 ? glide_left[a]
-                                                      : glide_left[a] * k;
-                glide_left[a] -= step;
-                glide_carry[a] += step;
-                // An idle axis keeps its rounding remainder for later; rounding
-                // it every frame could flip a carry of 0.5 back and forth.
-                out[a] = !step          ? 0
-                         : glide_left[a] ? (int)glide_carry[a]
-                                         : (int)lround(glide_carry[a]);
-                glide_carry[a] -= out[a];
-                if (glide_left[a])
+                    glide_left[a] = glide_vel[a] = glide_carry[a] = 0;
+                out[a] = glide_step(a, dt);
+                if (glide_left[a] || glide_vel[a])
                     active = TRUE;
             }
             LeaveCriticalSection(&glide_lock);
@@ -334,7 +369,8 @@ static BOOL passthrough_wheel(enum axis axis, int delta,
     }
     if (out_of_reach(ms->pt))
         return FALSE;
-    glide_push(axis, stretch_tail(axis, delta, ms->time) * GAIN * speed / 100);
+    double d = stretch_tail(axis, delta, ms->time) * GAIN * speed / 100;
+    glide_push(axis, d, ms->time);
     return TRUE;
 }
 
