@@ -28,12 +28,10 @@ scroll-options status
 scroll-options version
 ```
 
-To keep it around, choose **Install for this user** from the tray menu. That
-copies the exe to `%LOCALAPPDATA%\Programs\scroll-options` and restarts it
-from there. The installed copy's menu then has **Start with Windows**, which
-adds it to `HKCU\...\CurrentVersion\Run`, and **Open install location**. To update, exit the running copy and
-install the new exe the same way. **About** in the same menu shows the
-installed version.
+**Start with Windows** in the tray menu adds the exe, from wherever it is,
+to `HKCU\...\CurrentVersion\Run`, so keep it somewhere permanent first. To
+update, exit the running copy and replace the exe. **About** in the same menu
+shows the running version.
 
 Auto tells the two apart on its own: Sunshine either injects the Mac's input
 (flagged as injected in Windows) or sends it through its virtual "libvirtualhid

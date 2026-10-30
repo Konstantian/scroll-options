@@ -22,8 +22,7 @@
 // Passthrough and auto work through a low-level mouse hook, so it is only active
 // while the tray app runs. Settings are saved under
 // HKCU\Software\scroll-options and restored when the tray app starts.
-// The tray menu can install the exe under %LOCALAPPDATA%\Programs and, once
-// installed, start it with Windows.
+// The tray menu can set the exe to start with Windows.
 //
 //   scroll-options.exe                  run in the system tray
 //   scroll-options.exe auto             passthrough only for Sunshine input
@@ -56,15 +55,12 @@
 #define REG_KEY L"Software\\scroll-options"
 #define RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define HOMEPAGE L"https://github.com/Konstantian/scroll-options"
-#define INSTALL_DIR L"%LOCALAPPDATA%\\Programs\\scroll-options"
 #define WM_TRAY (WM_APP + 1)
 #define WM_RELOAD (WM_APP + 2) // CLI saved new settings
 #define ID_MODE 1              // menu ids ID_MODE + enum mode
 #define ID_EXIT 20
-#define ID_INSTALL 21
 #define ID_AUTOSTART 22
 #define ID_ABOUT 23
-#define ID_OPEN_DIR 24
 
 // Marks wheel events we inject so the hook lets them through.
 #define INJECTED_TAG ((ULONG_PTR)0x5C0110F7)
@@ -127,23 +123,9 @@ static BOOL save_mode(enum mode m)
     return rc == ERROR_SUCCESS;
 }
 
-// ---- install --------------------------------------------------------------
+// ---- autostart ------------------------------------------------------------
 
-// "Install" copies the exe to %LOCALAPPDATA%\Programs\scroll-options, where
-// it can be set to start with Windows through HKCU's Run key.
-
-static void install_path(wchar_t *buf, DWORD len)
-{
-    ExpandEnvironmentStringsW(INSTALL_DIR L"\\scroll-options.exe", buf, len);
-}
-
-static BOOL is_installed(void)
-{
-    wchar_t self[MAX_PATH], inst[MAX_PATH];
-    GetModuleFileNameW(NULL, self, MAX_PATH);
-    install_path(inst, MAX_PATH);
-    return !lstrcmpiW(self, inst);
-}
+// "Start with Windows" registers the running exe under HKCU's Run key.
 
 static BOOL autostart_enabled(void)
 {
@@ -178,51 +160,6 @@ static void show_error(const wchar_t *what, DWORD err)
     FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
                    NULL, err, 0, msg + n, ARRAYSIZE(msg) - n, NULL);
     MessageBoxW(NULL, msg, L"Scroll Options", MB_OK | MB_ICONERROR);
-}
-
-// Opens Explorer on the install folder with the exe selected.
-static void open_install_dir(void)
-{
-    wchar_t args[MAX_PATH + 16] = L"/select,\"";
-    install_path(args + lstrlenW(args), MAX_PATH);
-    lstrcatW(args, L"\"");
-    ShellExecuteW(NULL, NULL, L"explorer.exe", args, NULL, SW_SHOWNORMAL);
-}
-
-// Copies the exe into the install folder and hands the tray over to the
-// installed copy. Returns FALSE if this instance should keep running.
-static BOOL install(void)
-{
-    wchar_t self[MAX_PATH], dir[MAX_PATH], dest[MAX_PATH];
-    GetModuleFileNameW(NULL, self, MAX_PATH);
-    ExpandEnvironmentStringsW(INSTALL_DIR, dir, MAX_PATH);
-    install_path(dest, MAX_PATH);
-
-    // %LOCALAPPDATA%\Programs may not exist yet either.
-    wchar_t parent[MAX_PATH];
-    lstrcpyW(parent, dir);
-    *wcsrchr(parent, L'\\') = 0;
-    CreateDirectoryW(parent, NULL);
-    if (!CreateDirectoryW(dir, NULL) &&
-        GetLastError() != ERROR_ALREADY_EXISTS) {
-        show_error(L"Could not create the install folder", GetLastError());
-        return FALSE;
-    }
-    if (!CopyFileW(self, dest, FALSE)) {
-        show_error(L"Could not copy scroll-options.exe", GetLastError());
-        return FALSE;
-    }
-
-    // Let the installed copy take the single-instance mutex.
-    CloseHandle(tray_mutex);
-    tray_mutex = NULL;
-    if ((INT_PTR)ShellExecuteW(NULL, NULL, dest, NULL, NULL, SW_SHOWNORMAL)
-        <= 32) {
-        show_error(L"Installed, but could not start the installed copy",
-                   GetLastError());
-        return FALSE;
-    }
-    return TRUE;
 }
 
 // ---- passthrough ----------------------------------------------------------
@@ -501,12 +438,8 @@ static void show_menu(HWND hwnd)
     for (int i = 0; i < MODE_COUNT; i++)
         AppendMenuW(m, MF_STRING, ID_MODE + i, mode_labels[i]);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    if (is_installed()) {
-        AppendMenuW(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
-                    ID_AUTOSTART, L"Start with Windows");
-        AppendMenuW(m, MF_STRING, ID_OPEN_DIR, L"Open install location");
-    } else
-        AppendMenuW(m, MF_STRING, ID_INSTALL, L"Install for this user");
+    AppendMenuW(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
+                ID_AUTOSTART, L"Start with Windows");
     AppendMenuW(m, MF_STRING, ID_ABOUT, L"About");
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -538,11 +471,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             LSTATUS rc = set_autostart(!autostart_enabled());
             if (rc != ERROR_SUCCESS)
                 show_error(L"Could not change autostart", rc);
-        } else if (id == ID_INSTALL) {
-            if (install())
-                DestroyWindow(hwnd);
-        } else if (id == ID_OPEN_DIR) {
-            open_install_dir();
         } else if (id == ID_ABOUT) {
             show_about();
         } else if (id == ID_EXIT) {
