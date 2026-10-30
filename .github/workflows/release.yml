@@ -22,16 +22,16 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: smooth-scroll
-          path: smooth-scroll.exe
+          name: scroll-options
+          path: scroll-options.exe
 
       - name: Release
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="v1.0.${{ github.run_number }}"
-          gh release create "$tag" smooth-scroll.exe \
+          tag="v2.0.${{ github.run_number }}"
+          gh release create "$tag" scroll-options.exe \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$tag" \
