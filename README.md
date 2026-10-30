@@ -16,7 +16,7 @@ scrolling, and Windows apps scroll three lines (~100 px in a browser) per
 notch. Without help, a slow swipe travels about ten times as far as it does
 on the Mac. Passthrough:
 
-- scales trackpad deltas down, so slow swipes move about as far as on the Mac;
+- scales trackpad deltas down 5×, so swipes move roughly as far as on the Mac;
 - replays them evenly once per display frame, smoothing out network jitter;
 - leaves a real mouse wheel (whole notches), Ctrl+wheel zoom and windows it
   can't inject into (elevated apps such as Task Manager) untouched.
