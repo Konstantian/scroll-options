@@ -10,7 +10,7 @@ VERSION_NUM = $(subst .,$(comma),$(VERSION)),0
 scroll-options.exe: scroll-options.c version.o
 	$(CC) $(CFLAGS) -DVERSION='"$(VERSION)"' -o $@ $^ -lshell32 -ldwmapi
 
-version.o: scroll-options.rc FORCE
+version.o: scroll-options.rc scroll-options.ico FORCE
 	$(WINDRES) -DVERSION='\"$(VERSION)\"' -DVERSION_NUM=$(VERSION_NUM) $< $@
 
 clean:

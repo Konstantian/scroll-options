@@ -368,7 +368,9 @@ static void tray_add(HWND hwnd)
     nid.uID = 1;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
-    nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    nid.hIcon = LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1),
+                           IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                           GetSystemMetrics(SM_CYSMICON), LR_SHARED);
     Shell_NotifyIconW(NIM_ADD, &nid);
     tray_update();
 }
@@ -440,6 +442,7 @@ static int run_tray(HINSTANCE inst)
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = wndproc;
     wc.hInstance = inst;
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
     wc.lpszClassName = APP_NAME;
     RegisterClassW(&wc);
 
