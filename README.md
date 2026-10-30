@@ -7,7 +7,8 @@ Native scrolling over Moonlight feels right but goes too far, even at one
 line per notch in Windows. scroll-options multiplies every scroll event that
 comes in over Sunshine by a speed you pick (10–100% in the tray menu, 5–200%
 from the command line) and passes it on right away, with no smoothing. Mice
-plugged into the PC itself and Ctrl+wheel zoom are left alone.
+plugged into the PC itself and Ctrl+wheel zoom are left alone. **Off** stops
+scaling without exiting; picking a speed turns it back on.
 
 ## Usage
 
@@ -16,6 +17,7 @@ command line:
 
 ```
 scroll-options speed 60
+scroll-options off
 scroll-options status
 scroll-options version
 ```

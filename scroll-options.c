@@ -14,12 +14,13 @@
 //
 // It works through a low-level mouse hook, so it is only active while the
 // tray app runs. The speed is saved under HKCU\Software\scroll-options and
-// restored when the tray app starts. Autostart in the tray menu starts the
+// restored when the tray app starts. Off unhooks it without exiting. Autostart in the tray menu starts the
 // exe with Windows.
 //
 //   scroll-options.exe                  run in the system tray
-//   scroll-options.exe speed 60         set the speed in percent
-//   scroll-options.exe status           print the speed
+//   scroll-options.exe speed 60         set the speed in percent and turn on
+//   scroll-options.exe off              stop scaling until a speed is set
+//   scroll-options.exe status           print the speed, or off
 //   scroll-options.exe version          print the version
 
 #define WIN32_LEAN_AND_MEAN
@@ -48,6 +49,7 @@
 #define ID_EXIT 20
 #define ID_AUTOSTART 22
 #define ID_ABOUT 23
+#define ID_OFF 24
 #define ID_SPEED 30            // menu ids ID_SPEED + index into speeds
 
 // Marks wheel events we inject so the hook lets them through.
@@ -61,7 +63,7 @@
 #define SPEED_DEFAULT 60
 #define SPEED_MIN 5
 #define SPEED_MAX 200
-static const int speeds[] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+static const int speeds[] = {10, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100};
 
 enum axis { AXIS_V, AXIS_H };
 
@@ -71,34 +73,50 @@ static HWND tray_hwnd;
 static HANDLE tray_mutex;
 static HHOOK hook;
 static int speed = SPEED_DEFAULT;
+static BOOL enabled = TRUE;
 static DWORD own_integrity;
 static BOOL stream_mouse_last; // Sunshine's virtual mouse was used last
 
 // ---- settings -------------------------------------------------------------
 
-static int load_speed(void)
+static DWORD load_dword(const wchar_t *name, DWORD def)
 {
     DWORD v, size = sizeof v;
-    if (RegGetValueW(HKEY_CURRENT_USER, REG_KEY, L"Speed", RRF_RT_REG_DWORD,
-                     NULL, &v, &size) == ERROR_SUCCESS &&
-        v >= SPEED_MIN && v <= SPEED_MAX)
+    if (RegGetValueW(HKEY_CURRENT_USER, REG_KEY, name, RRF_RT_REG_DWORD,
+                     NULL, &v, &size) == ERROR_SUCCESS)
         return v;
-    return SPEED_DEFAULT;
+    return def;
 }
 
-static BOOL save_speed(int pct)
+static BOOL save_dword(const wchar_t *name, DWORD v)
 {
-    DWORD v = pct;
     HKEY key;
     LSTATUS rc = RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0,
                                  KEY_SET_VALUE, NULL, &key, NULL);
     if (rc == ERROR_SUCCESS) {
-        rc = RegSetValueExW(key, L"Speed", 0, REG_DWORD, (const BYTE *)&v,
+        rc = RegSetValueExW(key, name, 0, REG_DWORD, (const BYTE *)&v,
                             sizeof v);
         RegCloseKey(key);
     }
     SetLastError(rc);
     return rc == ERROR_SUCCESS;
+}
+
+static int load_speed(void)
+{
+    DWORD v = load_dword(L"Speed", SPEED_DEFAULT);
+    return v >= SPEED_MIN && v <= SPEED_MAX ? (int)v : SPEED_DEFAULT;
+}
+
+static BOOL load_enabled(void)
+{
+    return load_dword(L"Enabled", 1) != 0;
+}
+
+// Picking a speed also turns scaling back on.
+static BOOL save_speed(int pct)
+{
+    return save_dword(L"Speed", pct) && save_dword(L"Enabled", 1);
 }
 
 // ---- autostart ------------------------------------------------------------
@@ -300,16 +318,27 @@ static LRESULT CALLBACK mouse_hook(int code, WPARAM wp, LPARAM lp)
 static void tray_update(void)
 {
     wchar_t tip[64];
-    wsprintfW(tip, L"Scroll Options: %d%%%s", speed,
-              !hook ? L" (hook failed)" : L"");
+    if (!enabled)
+        lstrcpyW(tip, L"Scroll Options: off");
+    else
+        wsprintfW(tip, L"Scroll Options: %d%%%s", speed,
+                  !hook ? L" (hook failed)" : L"");
     lstrcpynW(nid.szTip, tip, ARRAYSIZE(nid.szTip));
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
-static void apply_speed(void)
+static void apply_settings(void)
 {
     speed = load_speed();
+    enabled = load_enabled();
     carry[0] = carry[1] = 0;
+    if (!enabled && hook) {
+        UnhookWindowsHookEx(hook);
+        hook = NULL;
+    } else if (enabled && !hook) {
+        hook = SetWindowsHookExW(WH_MOUSE_LL, mouse_hook,
+                                 GetModuleHandleW(NULL), 0);
+    }
     tray_update();
 }
 
@@ -349,14 +378,16 @@ static void show_menu(HWND hwnd)
     wchar_t label[32];
     for (int i = 0; i < (int)ARRAYSIZE(speeds); i++) {
         wsprintfW(label, L"%d%%", speeds[i]);
-        AppendMenuW(m, MF_STRING | (speeds[i] == speed ? MF_CHECKED : 0),
+        AppendMenuW(m, MF_STRING | (enabled && speeds[i] == speed
+                                        ? MF_CHECKED : 0),
                     ID_SPEED + i, label);
         preset |= speeds[i] == speed;
     }
-    if (!preset) {
+    if (!preset && enabled) {
         wsprintfW(label, L"%d%% (custom)", speed);
         AppendMenuW(m, MF_STRING | MF_CHECKED | MF_GRAYED, 0, label);
     }
+    AppendMenuW(m, MF_STRING | (!enabled ? MF_CHECKED : 0), ID_OFF, L"Off");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
                 ID_AUTOSTART, L"Autostart");
@@ -385,7 +416,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (id >= ID_SPEED && id < ID_SPEED + (int)ARRAYSIZE(speeds)) {
             if (!save_speed(speeds[id - ID_SPEED]))
                 show_error(L"Could not save the speed", GetLastError());
-            apply_speed();
+            apply_settings();
+        } else if (id == ID_OFF) {
+            if (!save_dword(L"Enabled", 0))
+                show_error(L"Could not save the setting", GetLastError());
+            apply_settings();
         } else if (id == ID_AUTOSTART) {
             LSTATUS rc = set_autostart(!autostart_enabled());
             if (rc != ERROR_SUCCESS)
@@ -398,7 +433,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_RELOAD:
-        apply_speed();
+        apply_settings();
         return 0;
     case WM_INPUT:
         raw_input((HRAWINPUT)lp);
@@ -445,10 +480,8 @@ static int run_tray(HINSTANCE inst)
     CloseHandle(CreateThread(NULL, 0, inject_thread, NULL, 0, NULL));
 
     watch_mice();
-    hook = SetWindowsHookExW(WH_MOUSE_LL, mouse_hook, GetModuleHandleW(NULL),
-                             0);
     tray_add(hwnd);
-    apply_speed();
+    apply_settings();
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
@@ -471,6 +504,16 @@ static void attach_console(void)
     }
 }
 
+// Tells a running tray app to pick up saved settings.
+static void reload_tray(void)
+{
+    HWND tray = FindWindowW(APP_NAME, NULL);
+    if (tray)
+        PostMessageW(tray, WM_RELOAD, 0, 0);
+    else
+        fprintf(stderr, "note: takes effect once the tray app is running\n");
+}
+
 static int run_cli(wchar_t **argv)
 {
     const wchar_t *cmd = argv[1];
@@ -487,12 +530,18 @@ static int run_cli(wchar_t **argv)
                     GetLastError());
             return 1;
         }
-        HWND tray = FindWindowW(APP_NAME, NULL);
-        if (tray)
-            PostMessageW(tray, WM_RELOAD, 0, 0);
         printf("%d%%\n", pct);
-        if (!tray)
-            fprintf(stderr, "note: takes effect once the tray app is running\n");
+        reload_tray();
+        return 0;
+    }
+    if (!lstrcmpiW(cmd, L"off")) {
+        if (!save_dword(L"Enabled", 0)) {
+            fprintf(stderr, "error: failed to save setting (%lu)\n",
+                    GetLastError());
+            return 1;
+        }
+        printf("off\n");
+        reload_tray();
         return 0;
     }
     if (!lstrcmpiW(cmd, L"version") || !lstrcmpiW(cmd, L"--version")) {
@@ -500,17 +549,21 @@ static int run_cli(wchar_t **argv)
         return 0;
     }
     if (!lstrcmpiW(cmd, L"status")) {
-        printf("%d%%\n", load_speed());
+        if (load_enabled())
+            printf("%d%%\n", load_speed());
+        else
+            printf("off\n");
         return 0;
     }
 
     BOOL help = !lstrcmpiW(cmd, L"help") || !lstrcmpiW(cmd, L"-h") ||
                 !lstrcmpiW(cmd, L"--help") || !lstrcmpiW(cmd, L"/?");
     fprintf(help ? stdout : stderr,
-            "usage: scroll-options [speed N | status | version]\n"
+            "usage: scroll-options [speed N | off | status | version]\n"
             "  (no arguments)   run in the system tray\n"
             "  speed N          scroll speed for Sunshine input, in percent (5-200)\n"
-            "  status           print the speed\n"
+            "  off              stop scaling until a speed is set again\n"
+            "  status           print the speed, or off\n"
             "  version          print the version\n");
     return help ? 0 : 2;
 }
