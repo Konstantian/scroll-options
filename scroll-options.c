@@ -1,8 +1,8 @@
 // scroll-options: tray utility for scrolling on a Windows PC you stream to
 // from a Mac with Moonlight/Sunshine.
 //
-//   native       leave Windows alone: no hook, no settings changed
 //   auto         passthrough for input from Sunshine, native for local mice
+//   native       leave Windows alone: no hook, no settings changed
 //   passthrough  make the Mac's trackpad scroll the way it does on the Mac
 //
 // Moonlight on macOS sends one wheel notch (120) per ~10 pt of trackpad
@@ -22,10 +22,12 @@
 // Passthrough and auto work through a low-level mouse hook, so it is only active
 // while the tray app runs. Settings are saved under
 // HKCU\Software\scroll-options and restored when the tray app starts.
+// The tray menu can install the exe under %LOCALAPPDATA%\Programs and, once
+// installed, start it with Windows.
 //
 //   scroll-options.exe                  run in the system tray
-//   scroll-options.exe native           leave scrolling alone
 //   scroll-options.exe auto             passthrough only for Sunshine input
+//   scroll-options.exe native           leave scrolling alone
 //   scroll-options.exe passthrough      Mac trackpad over Moonlight/Sunshine
 //   scroll-options.exe toggle           switch between native and passthrough
 //   scroll-options.exe status           print current mode
@@ -52,10 +54,16 @@
 
 #define APP_NAME L"scroll-options"
 #define REG_KEY L"Software\\scroll-options"
+#define RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define HOMEPAGE L"https://github.com/Konstantian/scroll-options"
+#define INSTALL_DIR L"%LOCALAPPDATA%\\Programs\\scroll-options"
 #define WM_TRAY (WM_APP + 1)
 #define WM_RELOAD (WM_APP + 2) // CLI saved new settings
 #define ID_MODE 1              // menu ids ID_MODE + enum mode
 #define ID_EXIT 20
+#define ID_INSTALL 21
+#define ID_AUTOSTART 22
+#define ID_ABOUT 23
 
 // Marks wheel events we inject so the hook lets them through.
 #define INJECTED_TAG ((ULONG_PTR)0x5C0110F7)
@@ -72,17 +80,18 @@
 // Hardware ID of Sunshine's virtual mouse (libvirtualhid's mouse profile).
 #define SUNSHINE_MOUSE_ID L"VID_1209&PID_0003"
 
-enum mode { MODE_NATIVE, MODE_AUTO, MODE_PASSTHROUGH, MODE_COUNT };
+enum mode { MODE_AUTO, MODE_NATIVE, MODE_PASSTHROUGH, MODE_COUNT };
 enum axis { AXIS_V, AXIS_H };
 
-static const wchar_t *mode_names[MODE_COUNT] = {L"native", L"auto",
+static const wchar_t *mode_names[MODE_COUNT] = {L"auto", L"native",
                                                 L"passthrough"};
-static const wchar_t *mode_labels[MODE_COUNT] = {L"Native", L"Auto",
+static const wchar_t *mode_labels[MODE_COUNT] = {L"Auto", L"Native",
                                                  L"Passthrough"};
 
 static NOTIFYICONDATAW nid;
 static UINT wm_taskbar_created;
 static HWND tray_hwnd;
+static HANDLE tray_mutex;
 static HHOOK hook;
 static enum mode mode = MODE_AUTO;
 static DWORD own_integrity;
@@ -115,6 +124,95 @@ static BOOL save_mode(enum mode m)
     }
     SetLastError(rc);
     return rc == ERROR_SUCCESS;
+}
+
+// ---- install --------------------------------------------------------------
+
+// "Install" copies the exe to %LOCALAPPDATA%\Programs\scroll-options, where
+// it can be set to start with Windows through HKCU's Run key.
+
+static void install_path(wchar_t *buf, DWORD len)
+{
+    ExpandEnvironmentStringsW(INSTALL_DIR L"\\scroll-options.exe", buf, len);
+}
+
+static BOOL is_installed(void)
+{
+    wchar_t self[MAX_PATH], inst[MAX_PATH];
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    install_path(inst, MAX_PATH);
+    return !lstrcmpiW(self, inst);
+}
+
+static BOOL autostart_enabled(void)
+{
+    return RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, APP_NAME, RRF_RT_REG_SZ,
+                        NULL, NULL, NULL) == ERROR_SUCCESS;
+}
+
+static LSTATUS set_autostart(BOOL on)
+{
+    HKEY key;
+    LSTATUS rc = RegCreateKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, NULL, 0,
+                                 KEY_SET_VALUE, NULL, &key, NULL);
+    if (rc != ERROR_SUCCESS)
+        return rc;
+    if (on) {
+        wchar_t cmd[MAX_PATH + 2] = L"\"";
+        GetModuleFileNameW(NULL, cmd + 1, MAX_PATH);
+        lstrcatW(cmd, L"\"");
+        rc = RegSetValueExW(key, APP_NAME, 0, REG_SZ, (const BYTE *)cmd,
+                            (lstrlenW(cmd) + 1) * sizeof *cmd);
+    } else {
+        rc = RegDeleteValueW(key, APP_NAME);
+    }
+    RegCloseKey(key);
+    return rc;
+}
+
+static void show_error(const wchar_t *what, DWORD err)
+{
+    wchar_t msg[512];
+    int n = wsprintfW(msg, L"%s (%lu)\n\n", what, err);
+    FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                   NULL, err, 0, msg + n, ARRAYSIZE(msg) - n, NULL);
+    MessageBoxW(NULL, msg, L"Scroll Options", MB_OK | MB_ICONERROR);
+}
+
+// Copies the exe into the install folder and hands the tray over to the
+// installed copy. Returns FALSE if this instance should keep running.
+static BOOL install(void)
+{
+    wchar_t self[MAX_PATH], dir[MAX_PATH], dest[MAX_PATH];
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    ExpandEnvironmentStringsW(INSTALL_DIR, dir, MAX_PATH);
+    install_path(dest, MAX_PATH);
+
+    // %LOCALAPPDATA%\Programs may not exist yet either.
+    wchar_t parent[MAX_PATH];
+    lstrcpyW(parent, dir);
+    *wcsrchr(parent, L'\\') = 0;
+    CreateDirectoryW(parent, NULL);
+    if (!CreateDirectoryW(dir, NULL) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        show_error(L"Could not create the install folder", GetLastError());
+        return FALSE;
+    }
+    if (!CopyFileW(self, dest, FALSE)) {
+        show_error(L"Could not copy scroll-options.exe", GetLastError());
+        return FALSE;
+    }
+
+    // Let the installed copy take the single-instance mutex.
+    CloseHandle(tray_mutex);
+    tray_mutex = NULL;
+    if ((INT_PTR)ShellExecuteW(NULL, NULL, dest, NULL, NULL, SW_SHOWNORMAL)
+        <= 32) {
+        show_error(L"Installed, but could not start the installed copy",
+                   GetLastError());
+        return FALSE;
+    }
+    return TRUE;
 }
 
 // ---- passthrough ----------------------------------------------------------
@@ -375,14 +473,33 @@ static void tray_add(HWND hwnd)
     tray_update();
 }
 
+static void show_about(void)
+{
+    if (MessageBoxW(NULL,
+                    L"Scroll Options " TEXT(VERSION) L"\n\n"
+                    L"Makes a Mac trackpad scroll naturally on a PC you stream "
+                    L"to with Moonlight/Sunshine.\n\n" HOMEPAGE L"\n\n"
+                    L"Open the project page?",
+                    L"About Scroll Options",
+                    MB_YESNO | MB_ICONINFORMATION) == IDYES)
+        ShellExecuteW(NULL, L"open", HOMEPAGE, NULL, NULL, SW_SHOWNORMAL);
+}
+
 static void show_menu(HWND hwnd)
 {
     HMENU m = CreatePopupMenu();
     for (int i = 0; i < MODE_COUNT; i++)
         AppendMenuW(m, MF_STRING, ID_MODE + i, mode_labels[i]);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Version " TEXT(VERSION));
+    if (is_installed())
+        AppendMenuW(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
+                    ID_AUTOSTART, L"Start with Windows");
+    else
+        AppendMenuW(m, MF_STRING, ID_INSTALL, L"Install for this user");
+    AppendMenuW(m, MF_STRING, ID_ABOUT, L"About");
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Version " TEXT(VERSION));
     CheckMenuRadioItem(m, ID_MODE, ID_MODE + MODE_COUNT - 1, ID_MODE + mode,
                        MF_BYCOMMAND);
 
@@ -406,6 +523,15 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (id >= ID_MODE && id < ID_MODE + MODE_COUNT) {
             save_mode(id - ID_MODE);
             apply_mode(id - ID_MODE);
+        } else if (id == ID_AUTOSTART) {
+            LSTATUS rc = set_autostart(!autostart_enabled());
+            if (rc != ERROR_SUCCESS)
+                show_error(L"Could not change autostart", rc);
+        } else if (id == ID_INSTALL) {
+            if (install())
+                DestroyWindow(hwnd);
+        } else if (id == ID_ABOUT) {
+            show_about();
         } else if (id == ID_EXIT) {
             DestroyWindow(hwnd);
         }
@@ -433,7 +559,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static int run_tray(HINSTANCE inst)
 {
-    CreateMutexW(NULL, TRUE, L"Local\\scroll-options-tray");
+    tray_mutex = CreateMutexW(NULL, TRUE, L"Local\\scroll-options-tray");
     if (GetLastError() == ERROR_ALREADY_EXISTS)
         return 0;
 
@@ -526,10 +652,10 @@ static int run_cli(wchar_t **argv)
     BOOL help = !lstrcmpiW(cmd, L"help") || !lstrcmpiW(cmd, L"-h") ||
                 !lstrcmpiW(cmd, L"--help") || !lstrcmpiW(cmd, L"/?");
     fprintf(help ? stdout : stderr,
-            "usage: scroll-options [native | auto | passthrough | toggle | status | version]\n"
+            "usage: scroll-options [auto | native | passthrough | toggle | status | version]\n"
             "  (no arguments)   run in the system tray\n"
-            "  native           leave Windows scrolling alone\n"
             "  auto             passthrough for Sunshine input, local mice untouched\n"
+            "  native           leave Windows scrolling alone\n"
             "  passthrough      Mac trackpad over Moonlight/Sunshine scrolls like on the Mac\n"
             "  toggle           switch to native, or from native to passthrough\n"
             "  status           print current mode\n"

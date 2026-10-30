@@ -3,10 +3,10 @@
 Tiny Windows tray app that makes a Mac trackpad scroll naturally on a PC you
 stream to with Moonlight/Sunshine.
 
-- **Native**: leaves Windows alone.
 - **Auto** (default): passthrough for scrolling that comes in over Sunshine,
   while mice plugged into the PC itself keep scrolling natively. No need to
   switch modes when you sit down at the PC.
+- **Native**: leaves Windows alone.
 - **Passthrough**: scales trackpad scrolling down 5× and smooths it out, so
   swipes move about as far as on the Mac. A real mouse wheel and Ctrl+wheel
   zoom are left untouched.
@@ -20,15 +20,20 @@ Run `scroll-options.exe` and pick a mode from the tray icon. Or from the
 command line:
 
 ```
-scroll-options native
 scroll-options auto
+scroll-options native
 scroll-options passthrough
 scroll-options toggle
 scroll-options status
 scroll-options version
 ```
 
-To start it with Windows, put a shortcut in `shell:startup`.
+To keep it around, choose **Install for this user** from the tray menu. That
+copies the exe to `%LOCALAPPDATA%\Programs\scroll-options` and restarts it
+from there. The installed copy's menu then has **Start with Windows**, which
+adds it to `HKCU\...\CurrentVersion\Run`. To update, exit the running copy and
+install the new exe the same way. **About** in the same menu shows the
+installed version.
 
 Auto tells the two apart on its own: Sunshine either injects the Mac's input
 (flagged as injected in Windows) or sends it through its virtual "libvirtualhid
