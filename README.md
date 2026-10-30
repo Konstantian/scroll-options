@@ -3,10 +3,10 @@
 Tiny Windows tray app that makes a Mac trackpad scroll naturally on a PC you
 stream to with Moonlight/Sunshine.
 
-- **Native** (default): leaves Windows alone.
-- **Auto**: passthrough for scrolling that comes in over Sunshine, while mice
-  plugged into the PC itself keep scrolling natively. No need to switch modes
-  when you sit down at the PC.
+- **Native**: leaves Windows alone.
+- **Auto** (default): passthrough for scrolling that comes in over Sunshine,
+  while mice plugged into the PC itself keep scrolling natively. No need to
+  switch modes when you sit down at the PC.
 - **Passthrough**: scales trackpad scrolling down 5× and smooths it out, so
   swipes move about as far as on the Mac. A real mouse wheel and Ctrl+wheel
   zoom are left untouched.
@@ -46,4 +46,5 @@ For the most direct feel, turn off smooth scrolling in your browser.
 ## Build
 
 Needs MinGW-w64: `make` (or `make VERSION=1.2.3`). Every push to `main` is
-released on GitHub as `v1.0.<run number>`.
+released on GitHub as `v1.0.<run number>`, with the exe named
+`scroll-options-<version>-x64.exe`.

@@ -77,17 +77,14 @@ enum axis { AXIS_V, AXIS_H };
 
 static const wchar_t *mode_names[MODE_COUNT] = {L"native", L"auto",
                                                 L"passthrough"};
-static const wchar_t *mode_labels[MODE_COUNT] = {
-    L"Native Windows (no changes)",
-    L"Auto (Moonlight only, local mice native)",
-    L"Passthrough (Mac trackpad over Moonlight)",
-};
+static const wchar_t *mode_labels[MODE_COUNT] = {L"Native", L"Auto",
+                                                 L"Passthrough"};
 
 static NOTIFYICONDATAW nid;
 static UINT wm_taskbar_created;
 static HWND tray_hwnd;
 static HHOOK hook;
-static enum mode mode = MODE_NATIVE;
+static enum mode mode = MODE_AUTO;
 static DWORD own_integrity;
 static BOOL stream_mouse_last; // Sunshine's virtual mouse was used last
 
@@ -102,7 +99,7 @@ static enum mode load_mode(void)
         for (int m = 0; m < MODE_COUNT; m++)
             if (!lstrcmpiW(buf, mode_names[m]))
                 return m;
-    return MODE_NATIVE;
+    return MODE_AUTO;
 }
 
 static BOOL save_mode(enum mode m)
