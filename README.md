@@ -10,6 +10,11 @@ stream to with Moonlight/Sunshine.
 - **Passthrough**: scales trackpad scrolling down 5× and smooths it out, so
   swipes move about as far as on the Mac. A real mouse wheel and Ctrl+wheel
   zoom are left untouched.
+- **Scaled**: separate from the modes above. Scrolling from Sunshine keeps
+  its native feel but is multiplied by **Scaled speed** (20–100% in the tray
+  menu, 5–200% from the command line), with no smoothing. Use it when native
+  scrolling is fine apart from being too fast, even at one line per notch in
+  Windows. Local mice and Ctrl+wheel zoom are left alone.
 
 Moonlight limits each scroll event it sends to one wheel notch, so very fast
 flicks come out a little shorter than on the Mac.
@@ -23,6 +28,8 @@ command line:
 scroll-options auto
 scroll-options native
 scroll-options passthrough
+scroll-options scaled
+scroll-options speed 60
 scroll-options toggle
 scroll-options status
 scroll-options version

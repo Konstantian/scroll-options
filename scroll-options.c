@@ -4,6 +4,7 @@
 //   auto         passthrough for input from Sunshine, native for local mice
 //   native       leave Windows alone: no hook, no settings changed
 //   passthrough  make the Mac's trackpad scroll the way it does on the Mac
+//   scaled       scroll Sunshine input at a set speed, no smoothing
 //
 // Moonlight on macOS sends one wheel notch (120) per ~10 pt of trackpad
 // scrolling, and Windows apps scroll three lines (~100 px in a browser) per
@@ -19,7 +20,12 @@
 // Mouse". That one looks like hardware to the hook, so Raw Input tracks
 // whether it or a local mouse was used last.
 //
-// Passthrough and auto work through a low-level mouse hook, so it is only active
+// Scaled is separate from the other two: it multiplies every wheel event
+// from Sunshine by the speed setting (a percentage) and injects it right
+// away, for when native scrolling feels right apart from its speed and one
+// line per notch in Windows is still too much.
+//
+// Passthrough, auto and scaled work through a low-level mouse hook, so it is only active
 // while the tray app runs. Settings are saved under
 // HKCU\Software\scroll-options and restored when the tray app starts.
 // The tray menu can set the exe to start with Windows.
@@ -28,6 +34,8 @@
 //   scroll-options.exe auto             passthrough only for Sunshine input
 //   scroll-options.exe native           leave scrolling alone
 //   scroll-options.exe passthrough      Mac trackpad over Moonlight/Sunshine
+//   scroll-options.exe scaled           Sunshine input at the speed setting
+//   scroll-options.exe speed 60         set the scaled speed in percent
 //   scroll-options.exe toggle           switch between native and passthrough
 //   scroll-options.exe status           print current mode
 //   scroll-options.exe version          print the version
@@ -61,6 +69,7 @@
 #define ID_EXIT 20
 #define ID_AUTOSTART 22
 #define ID_ABOUT 23
+#define ID_SPEED 30            // menu ids ID_SPEED + index into speeds
 
 // Marks wheel events we inject so the hook lets them through.
 #define INJECTED_TAG ((ULONG_PTR)0x5C0110F7)
@@ -77,13 +86,21 @@
 // Hardware ID of Sunshine's virtual mouse (libvirtualhid's mouse profile).
 #define SUNSHINE_MOUSE_ID L"VID_1209&PID_0003"
 
-enum mode { MODE_AUTO, MODE_NATIVE, MODE_PASSTHROUGH, MODE_COUNT };
+// Scaled mode: speed in percent, the presets in the tray menu and the range
+// the CLI accepts.
+#define SPEED_DEFAULT 60
+#define SPEED_MIN 5
+#define SPEED_MAX 200
+static const int speeds[] = {20, 30, 40, 50, 60, 70, 80, 90, 100};
+
+enum mode { MODE_AUTO, MODE_NATIVE, MODE_PASSTHROUGH, MODE_SCALED,
+            MODE_COUNT };
 enum axis { AXIS_V, AXIS_H };
 
 static const wchar_t *mode_names[MODE_COUNT] = {L"auto", L"native",
-                                                L"passthrough"};
+                                                L"passthrough", L"scaled"};
 static const wchar_t *mode_labels[MODE_COUNT] = {L"Auto", L"Native",
-                                                 L"Passthrough"};
+                                                 L"Passthrough", L"Scaled"};
 
 static NOTIFYICONDATAW nid;
 static UINT wm_taskbar_created;
@@ -91,6 +108,7 @@ static HWND tray_hwnd;
 static HANDLE tray_mutex;
 static HHOOK hook;
 static enum mode mode = MODE_AUTO;
+static int speed = SPEED_DEFAULT;
 static DWORD own_integrity;
 static BOOL stream_mouse_last; // Sunshine's virtual mouse was used last
 
@@ -117,6 +135,31 @@ static BOOL save_mode(enum mode m)
     if (rc == ERROR_SUCCESS) {
         rc = RegSetValueExW(key, L"Mode", 0, REG_SZ, (const BYTE *)s,
                             (lstrlenW(s) + 1) * sizeof *s);
+        RegCloseKey(key);
+    }
+    SetLastError(rc);
+    return rc == ERROR_SUCCESS;
+}
+
+static int load_speed(void)
+{
+    DWORD v, size = sizeof v;
+    if (RegGetValueW(HKEY_CURRENT_USER, REG_KEY, L"Speed", RRF_RT_REG_DWORD,
+                     NULL, &v, &size) == ERROR_SUCCESS &&
+        v >= SPEED_MIN && v <= SPEED_MAX)
+        return v;
+    return SPEED_DEFAULT;
+}
+
+static BOOL save_speed(int pct)
+{
+    DWORD v = pct;
+    HKEY key;
+    LSTATUS rc = RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0,
+                                 KEY_SET_VALUE, NULL, &key, NULL);
+    if (rc == ERROR_SUCCESS) {
+        rc = RegSetValueExW(key, L"Speed", 0, REG_DWORD, (const BYTE *)&v,
+                            sizeof v);
         RegCloseKey(key);
     }
     SetLastError(rc);
@@ -318,6 +361,28 @@ static BOOL passthrough_wheel(enum axis axis, int delta,
     return TRUE;
 }
 
+// ---- scaled ---------------------------------------------------------------
+
+// Remainders below one wheel unit carry over to the next event, so slow
+// scrolls at a low speed still add up. Only the hook thread touches these.
+static double scaled_carry[2];
+
+// Returns TRUE if it took the event over (the hook then swallows it).
+static BOOL scaled_wheel(enum axis axis, int delta, const MSLLHOOKSTRUCT *ms)
+{
+    if (speed == 100 || GetAsyncKeyState(VK_CONTROL) < 0 || // zoom as is
+        out_of_reach(ms->pt))
+        return FALSE;
+    if (scaled_carry[axis] * delta < 0) // reversed: drop the old remainder
+        scaled_carry[axis] = 0;
+    scaled_carry[axis] += delta * speed / 100.0;
+    int out = (int)scaled_carry[axis];
+    scaled_carry[axis] -= out;
+    if (out)
+        inject_wheel(axis, out);
+    return TRUE;
+}
+
 // ---- auto -----------------------------------------------------------------
 
 static BOOL is_stream_mouse(HANDLE dev)
@@ -371,8 +436,10 @@ static LRESULT CALLBACK mouse_hook(int code, WPARAM wp, LPARAM lp)
         enum axis axis = wp == WM_MOUSEHWHEEL ? AXIS_H : AXIS_V;
         int delta = GET_WHEEL_DELTA_WPARAM(ms->mouseData);
         if (ms->dwExtraInfo != INJECTED_TAG && delta &&
-            (mode != MODE_AUTO || from_stream(ms)) &&
-            passthrough_wheel(axis, delta, ms))
+            (mode == MODE_SCALED
+                 ? from_stream(ms) && scaled_wheel(axis, delta, ms)
+                 : (mode != MODE_AUTO || from_stream(ms)) &&
+                       passthrough_wheel(axis, delta, ms)))
             return 1;
     }
     return CallNextHookEx(NULL, code, wp, lp);
@@ -382,8 +449,10 @@ static LRESULT CALLBACK mouse_hook(int code, WPARAM wp, LPARAM lp)
 
 static void tray_update(void)
 {
-    wchar_t tip[64];
-    wsprintfW(tip, L"Scroll Options: %s%s", mode_names[mode],
+    wchar_t tip[64], pct[16] = L"";
+    if (mode == MODE_SCALED)
+        wsprintfW(pct, L" %d%%", speed);
+    wsprintfW(tip, L"Scroll Options: %s%s%s", mode_names[mode], pct,
               mode != MODE_NATIVE && !hook ? L" (hook failed)" : L"");
     lstrcpynW(nid.szTip, tip, ARRAYSIZE(nid.szTip));
     Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -392,8 +461,10 @@ static void tray_update(void)
 static void apply_mode(enum mode m)
 {
     mode = m;
+    speed = load_speed();
     glide_cancel();
-    watch_mice(m == MODE_AUTO);
+    scaled_carry[0] = scaled_carry[1] = 0;
+    watch_mice(m == MODE_AUTO || m == MODE_SCALED);
 
     if (m == MODE_NATIVE) {
         if (hook)
@@ -437,6 +508,23 @@ static void show_menu(HWND hwnd)
     HMENU m = CreatePopupMenu();
     for (int i = 0; i < MODE_COUNT; i++)
         AppendMenuW(m, MF_STRING, ID_MODE + i, mode_labels[i]);
+    // Only usable in scaled mode; a speed set from the CLI that isn't a
+    // preset shows up as the checked item at the end.
+    HMENU sm = CreatePopupMenu();
+    BOOL preset = FALSE;
+    wchar_t label[32];
+    for (int i = 0; i < (int)ARRAYSIZE(speeds); i++) {
+        wsprintfW(label, L"%d%%", speeds[i]);
+        AppendMenuW(sm, MF_STRING | (speeds[i] == speed ? MF_CHECKED : 0),
+                    ID_SPEED + i, label);
+        preset |= speeds[i] == speed;
+    }
+    if (!preset) {
+        wsprintfW(label, L"%d%% (custom)", speed);
+        AppendMenuW(sm, MF_STRING | MF_CHECKED | MF_GRAYED, 0, label);
+    }
+    AppendMenuW(m, MF_POPUP | (mode == MODE_SCALED ? 0 : MF_GRAYED),
+                (UINT_PTR)sm, L"Scaled speed");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
                 ID_AUTOSTART, L"Start with Windows");
@@ -467,6 +555,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (id >= ID_MODE && id < ID_MODE + MODE_COUNT) {
             save_mode(id - ID_MODE);
             apply_mode(id - ID_MODE);
+        } else if (id >= ID_SPEED && id < ID_SPEED + (int)ARRAYSIZE(speeds)) {
+            if (!save_speed(speeds[id - ID_SPEED]))
+                show_error(L"Could not save the speed", GetLastError());
+            apply_mode(mode);
         } else if (id == ID_AUTOSTART) {
             LSTATUS rc = set_autostart(!autostart_enabled());
             if (rc != ERROR_SUCCESS)
@@ -585,19 +677,44 @@ static int run_cli(wchar_t **argv)
         printf("scroll-options %s\n", VERSION);
         return 0;
     }
+    if (!lstrcmpiW(cmd, L"speed") && argv[2]) {
+        int pct = _wtoi(argv[2]);
+        if (pct < SPEED_MIN || pct > SPEED_MAX) {
+            fprintf(stderr, "error: speed must be %d to %d (percent)\n",
+                    SPEED_MIN, SPEED_MAX);
+            return 2;
+        }
+        if (!save_speed(pct)) {
+            fprintf(stderr, "error: failed to save setting (%lu)\n",
+                    GetLastError());
+            return 1;
+        }
+        reload_tray();
+        printf("speed %d%%\n", pct);
+        if (load_mode() != MODE_SCALED)
+            fprintf(stderr, "note: only used in scaled mode\n");
+        return 0;
+    }
     if (!lstrcmpiW(cmd, L"status")) {
-        printf("%ls\n", mode_names[load_mode()]);
+        enum mode m = load_mode();
+        if (m == MODE_SCALED)
+            printf("scaled %d%%\n", load_speed());
+        else
+            printf("%ls\n", mode_names[m]);
         return 0;
     }
 
     BOOL help = !lstrcmpiW(cmd, L"help") || !lstrcmpiW(cmd, L"-h") ||
                 !lstrcmpiW(cmd, L"--help") || !lstrcmpiW(cmd, L"/?");
     fprintf(help ? stdout : stderr,
-            "usage: scroll-options [auto | native | passthrough | toggle | status | version]\n"
+            "usage: scroll-options [auto | native | passthrough | scaled | speed N |\n"
+            "                      toggle | status | version]\n"
             "  (no arguments)   run in the system tray\n"
             "  auto             passthrough for Sunshine input, local mice untouched\n"
             "  native           leave Windows scrolling alone\n"
             "  passthrough      Mac trackpad over Moonlight/Sunshine scrolls like on the Mac\n"
+            "  scaled           Sunshine input at the speed setting, no smoothing\n"
+            "  speed N          scaled speed in percent (5-200)\n"
             "  toggle           switch to native, or from native to passthrough\n"
             "  status           print current mode\n"
             "  version          print the version\n");
