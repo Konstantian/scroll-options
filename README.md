@@ -31,7 +31,7 @@ scroll-options version
 To keep it around, choose **Install for this user** from the tray menu. That
 copies the exe to `%LOCALAPPDATA%\Programs\scroll-options` and restarts it
 from there. The installed copy's menu then has **Start with Windows**, which
-adds it to `HKCU\...\CurrentVersion\Run`. To update, exit the running copy and
+adds it to `HKCU\...\CurrentVersion\Run`, and **Open install location**. To update, exit the running copy and
 install the new exe the same way. **About** in the same menu shows the
 installed version.
 

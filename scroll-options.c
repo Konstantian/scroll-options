@@ -64,6 +64,7 @@
 #define ID_INSTALL 21
 #define ID_AUTOSTART 22
 #define ID_ABOUT 23
+#define ID_OPEN_DIR 24
 
 // Marks wheel events we inject so the hook lets them through.
 #define INJECTED_TAG ((ULONG_PTR)0x5C0110F7)
@@ -177,6 +178,15 @@ static void show_error(const wchar_t *what, DWORD err)
     FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
                    NULL, err, 0, msg + n, ARRAYSIZE(msg) - n, NULL);
     MessageBoxW(NULL, msg, L"Scroll Options", MB_OK | MB_ICONERROR);
+}
+
+// Opens Explorer on the install folder with the exe selected.
+static void open_install_dir(void)
+{
+    wchar_t args[MAX_PATH + 16] = L"/select,\"";
+    install_path(args + lstrlenW(args), MAX_PATH);
+    lstrcatW(args, L"\"");
+    ShellExecuteW(NULL, NULL, L"explorer.exe", args, NULL, SW_SHOWNORMAL);
 }
 
 // Copies the exe into the install folder and hands the tray over to the
@@ -491,10 +501,11 @@ static void show_menu(HWND hwnd)
     for (int i = 0; i < MODE_COUNT; i++)
         AppendMenuW(m, MF_STRING, ID_MODE + i, mode_labels[i]);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    if (is_installed())
+    if (is_installed()) {
         AppendMenuW(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
                     ID_AUTOSTART, L"Start with Windows");
-    else
+        AppendMenuW(m, MF_STRING, ID_OPEN_DIR, L"Open install location");
+    } else
         AppendMenuW(m, MF_STRING, ID_INSTALL, L"Install for this user");
     AppendMenuW(m, MF_STRING, ID_ABOUT, L"About");
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
@@ -530,6 +541,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         } else if (id == ID_INSTALL) {
             if (install())
                 DestroyWindow(hwnd);
+        } else if (id == ID_OPEN_DIR) {
+            open_install_dir();
         } else if (id == ID_ABOUT) {
             show_about();
         } else if (id == ID_EXIT) {
